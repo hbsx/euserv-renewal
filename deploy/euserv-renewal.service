@@ -8,5 +8,5 @@ Type=oneshot
 WorkingDirectory=/opt/euserv-renewal
 Environment=PYTHONUNBUFFERED=1
 ExecStart=/usr/bin/flock -n /run/euserv-renewal.lock /usr/bin/python3 /opt/euserv-renewal/euserv_renew.py --commit
-TimeoutStartSec=10min
+TimeoutStartSec=15min
 Restart=no

@@ -13,6 +13,7 @@
 - 网页未显示已知成功文字时，会等待最新的 `Extension of your contract` 邮件，并核对合同编号和新到期日期。
 - 默认不提交最终续期；只有 `--commit` 才会正式确认。
 - 每次运行最多执行一次续期，不自动重复登录或重复提交。
+- 正式运行必须配置明确的合同编号，避免误操作其他合同。
 - 正式运行时推送三类 Telegram 结果：
   - `✅` 页面明确显示续期成功；
   - `⚠️` 没有找到续期入口，可能已续期或尚未开放；
@@ -156,7 +157,7 @@ systemctl enable --now euserv-renewal.timer
 systemctl list-timers euserv-renewal.timer --no-pager
 ```
 
-服务带有 `--commit`，因此定时触发属于正式运行。`flock` 防止并发；服务不自动重启；`Persistent=false` 表示错过当月时间后不会补跑。
+服务带有 `--commit`，因此定时触发属于正式运行。`flock` 防止并发；服务不自动重启；最长运行时间为 15 分钟；`Persistent=false` 表示错过当月时间后不会补跑。
 
 查看日志：
 
@@ -196,7 +197,9 @@ python3 -m py_compile euserv_renew.py
 
 设置 `GMAIL_SOCKS_HOST` 和 `GMAIL_SOCKS_PORT`，并确认已安装 `python3-socks`。代理只用于 Gmail IMAP。
 
-脚本从最近邮件开始倒序检查，并按本次登录或续期请求时间过滤。历史 PIN 邮件可以继续保留在邮箱中；脚本使用 IMAP `PEEK` 读取，不会删除邮件。
+脚本从最近邮件开始倒序检查，并优先使用 Gmail 的 IMAP 到达时间按本次登录或续期请求过滤。无法取得可靠时间的邮件会被忽略。历史 PIN 邮件可以继续保留在邮箱中；脚本使用 IMAP `PEEK` 读取，不会删除邮件。
+
+如果运行失败，脚本会在工作目录保存 `failure.png`。截图可能包含账户或合同信息，只应用于本机排查，不要公开上传。
 
 续期提交后若网页成功提示无法识别，脚本最多再等待 `GMAIL_CONFIRMATION_TIMEOUT` 秒（默认 300 秒）查找本次新到达的续期确认邮件。只有邮件主题中的合同编号匹配，并且正文包含 `has been extended until YYYY-MM-DD`，才会发送成功通知。
 

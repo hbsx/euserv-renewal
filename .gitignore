@@ -3,6 +3,7 @@ __pycache__/
 .venv/
 browser-profile/
 no-renewal-action.png
+failure.png
 *.log
 .venv/
 browser-profile/

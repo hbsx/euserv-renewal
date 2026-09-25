@@ -19,9 +19,8 @@ from email.header import decode_header
 from pathlib import Path
 
 from selenium import webdriver
-from selenium.common.exceptions import NoSuchElementException, TimeoutException
+from selenium.common.exceptions import TimeoutException
 from selenium.webdriver.common.by import By
-from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
 
 
@@ -65,6 +64,21 @@ def message_text(msg):
         if payload:
             chunks.append(payload.decode(part.get_content_charset() or "utf-8", errors="replace"))
     return "\n".join(chunks)
+
+
+def message_timestamp(msg, fetch_metadata):
+    """Return Gmail's arrival time, falling back to the message Date header."""
+    try:
+        internal_time = imaplib.Internaldate2tuple(fetch_metadata)
+        if internal_time:
+            return time.mktime(internal_time)
+    except Exception:
+        pass
+    try:
+        from email.utils import parsedate_to_datetime
+        return parsedate_to_datetime(msg.get("Date")).astimezone(timezone.utc).timestamp()
+    except Exception:
+        return None
 
 
 def open_gmail_imap():
@@ -120,16 +134,13 @@ def wait_for_gmail_code(not_before, timeout, excluded_codes=None):
                 raise RuntimeError("Could not search Gmail INBOX")
             for uid in reversed(data[0].split()[-20:]):
                 # PEEK avoids changing the message's read/unread state where supported.
-                status, raw = client.fetch(uid, "(BODY.PEEK[])")
+                status, raw = client.fetch(uid, "(INTERNALDATE BODY.PEEK[])")
                 if status != "OK" or not raw or not raw[0]:
                     continue
                 msg = message_from_bytes(raw[0][1])
-                date_value = msg.get("Date")
-                try:
-                    from email.utils import parsedate_to_datetime
-                    sent_at = parsedate_to_datetime(date_value).astimezone(timezone.utc).timestamp()
-                except Exception:
-                    sent_at = time.time()
+                sent_at = message_timestamp(msg, raw[0][0])
+                if sent_at is None:
+                    continue
                 # Allow only a small amount of clock skew; historical PIN mail is ignored.
                 if sent_at < not_before - 30:
                     continue
@@ -168,15 +179,13 @@ def wait_for_gmail_confirmation(not_before, timeout, contract_number=""):
             if status != "OK":
                 raise RuntimeError("Could not search Gmail INBOX")
             for uid in reversed(data[0].split()[-30:]):
-                status, raw = client.fetch(uid, "(BODY.PEEK[])")
+                status, raw = client.fetch(uid, "(INTERNALDATE BODY.PEEK[])")
                 if status != "OK" or not raw or not raw[0]:
                     continue
                 msg = message_from_bytes(raw[0][1])
-                try:
-                    from email.utils import parsedate_to_datetime
-                    sent_at = parsedate_to_datetime(msg.get("Date")).astimezone(timezone.utc).timestamp()
-                except Exception:
-                    sent_at = time.time()
+                sent_at = message_timestamp(msg, raw[0][0])
+                if sent_at is None:
+                    continue
                 if sent_at < not_before - 30:
                     continue
 
@@ -307,6 +316,8 @@ def wait_for_manual_captcha(driver, timeout):
     ], 3)
     if not captcha:
         return
+    if os.getenv("HEADLESS", "false").lower() == "true":
+        raise RuntimeError("A visual CAPTCHA was detected in headless mode; manual login is required")
     print("A visual CAPTCHA is displayed. Complete it in the browser, then press Enter here.")
     input()
 
@@ -334,11 +345,11 @@ def verification_code_box(driver, timeout):
 
 
 def main():
+    load_dotenv()
     parser = argparse.ArgumentParser(description="EUserv renewal helper")
     parser.add_argument("--commit", action="store_true", help="allow the final renewal submission")
     parser.add_argument("--timeout", type=int, default=int(os.getenv("TIMEOUT_SECONDS", "25")))
     args = parser.parse_args()
-    load_dotenv()
 
     username, password = required("EUSERV_USERNAME"), required("EUSERV_PASSWORD")
     options = webdriver.ChromeOptions()
@@ -375,7 +386,7 @@ def main():
             print("Reusing existing EUserv browser session; no login submitted.")
 
         # Some accounts ask for an email code immediately after login.
-        code_box = verification_code_box(driver, 8)
+        code_box = verification_code_box(driver, args.timeout)
         if code_box:
             print("Waiting for EUserv login verification email…")
             login_code = wait_for_gmail_code(started, 180)
@@ -383,6 +394,8 @@ def main():
             click_by_text(driver, ["confirm", "verify", "bestätigen", "weiter", "continue"], args.timeout)
 
         contract = os.getenv("EUSERV_CONTRACT_NUMBER", "").strip()
+        if args.commit and not contract:
+            raise RuntimeError("EUSERV_CONTRACT_NUMBER is required when --commit is used")
         if contract:
             click_by_text(driver, [contract], args.timeout)
         print("Looking for renewal action…")
@@ -405,7 +418,7 @@ def main():
             return
 
         # If the renewal flow sends a second email code, fill it in.
-        code_box = verification_code_box(driver, 8)
+        code_box = verification_code_box(driver, args.timeout)
         if code_box:
             print("Waiting for EUserv renewal verification email…")
             excluded = {login_code} if login_code else set()
@@ -451,6 +464,14 @@ def main():
                     "❌ EUserv renewal was submitted, but neither the website nor a new confirmation email "
                     "proved success. Please check the account and systemd log."
                 )
+    except Exception:
+        diagnostic = Path.cwd() / "failure.png"
+        try:
+            driver.save_screenshot(str(diagnostic))
+            print("Failure screenshot saved to {}.".format(diagnostic), file=sys.stderr)
+        except Exception:
+            pass
+        raise
     finally:
         if os.getenv("HEADLESS", "false").lower() == "true":
             driver.quit()
