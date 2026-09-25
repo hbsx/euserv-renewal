@@ -257,6 +257,21 @@ def fill(driver, selectors, value, timeout):
     return element
 
 
+def verification_code_box(driver, timeout):
+    """Find EUserv login or renewal verification fields used by known UI variants."""
+    return first_visible(
+        driver,
+        [
+            (By.CSS_SELECTOR, "input[name='auth']"),
+            (By.CSS_SELECTOR, "input[name='pin']"),
+            (By.CSS_SELECTOR, "input[name*='code']"),
+            (By.CSS_SELECTOR, "input[name*='otp']"),
+            (By.CSS_SELECTOR, "input[autocomplete='one-time-code']"),
+        ],
+        timeout,
+    )
+
+
 def main():
     parser = argparse.ArgumentParser(description="EUserv renewal helper")
     parser.add_argument("--commit", action="store_true", help="allow the final renewal submission")
@@ -298,7 +313,7 @@ def main():
             print("Reusing existing EUserv browser session; no login submitted.")
 
         # Some accounts ask for an email code immediately after login.
-        code_box = first_visible(driver, [(By.CSS_SELECTOR, "input[name*='code']"), (By.CSS_SELECTOR, "input[name*='otp']"), (By.CSS_SELECTOR, "input[autocomplete='one-time-code']")], 8)
+        code_box = verification_code_box(driver, 8)
         if code_box:
             print("Waiting for EUserv login verification email…")
             code_box.send_keys(wait_for_gmail_code(started, 180))
@@ -326,7 +341,7 @@ def main():
             return
 
         # If the renewal flow sends a second email code, fill it in.
-        code_box = first_visible(driver, [(By.CSS_SELECTOR, "input[name*='code']"), (By.CSS_SELECTOR, "input[name*='otp']"), (By.CSS_SELECTOR, "input[autocomplete='one-time-code']")], 8)
+        code_box = verification_code_box(driver, 8)
         if code_box:
             print("Waiting for EUserv renewal verification email…")
             code_box.send_keys(wait_for_gmail_code(started, 180))
