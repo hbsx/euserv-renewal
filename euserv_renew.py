@@ -100,13 +100,14 @@ def open_gmail_imap():
     return SocksIMAP4SSL(imap_host, 993, timeout=timeout)
 
 
-def wait_for_gmail_code(not_before, timeout):
-    """Poll Gmail INBOX for a recent EUserv verification code."""
+def wait_for_gmail_code(not_before, timeout, excluded_codes=None):
+    """Poll Gmail for the newest recent PIN, ignoring old or already-used codes."""
     address = required("GMAIL_ADDRESS")
     password = required("GMAIL_APP_PASSWORD").replace(" ", "")
     sender_hint = os.getenv("GMAIL_FROM_HINT", "euserv").lower()
     subject_hint = os.getenv("GMAIL_SUBJECT_HINT", "").lower()
     pattern = re.compile(os.getenv("CODE_REGEX", r"(?<!\d)(\d{6})(?!\d)"))
+    excluded_codes = set(excluded_codes or ())
     deadline = time.time() + timeout
 
     while time.time() < deadline:
@@ -118,7 +119,8 @@ def wait_for_gmail_code(not_before, timeout):
             if status != "OK":
                 raise RuntimeError("Could not search Gmail INBOX")
             for uid in reversed(data[0].split()[-20:]):
-                status, raw = client.fetch(uid, "(RFC822)")
+                # PEEK avoids changing the message's read/unread state where supported.
+                status, raw = client.fetch(uid, "(BODY.PEEK[])")
                 if status != "OK" or not raw or not raw[0]:
                     continue
                 msg = message_from_bytes(raw[0][1])
@@ -128,7 +130,8 @@ def wait_for_gmail_code(not_before, timeout):
                     sent_at = parsedate_to_datetime(date_value).astimezone(timezone.utc).timestamp()
                 except Exception:
                     sent_at = time.time()
-                if sent_at < not_before - 120:
+                # Allow only a small amount of clock skew; historical PIN mail is ignored.
+                if sent_at < not_before - 30:
                     continue
                 sender = decoded(msg.get("From", "")).lower()
                 subject = decoded(msg.get("Subject", "")).lower()
@@ -138,7 +141,7 @@ def wait_for_gmail_code(not_before, timeout):
                 if subject_hint and subject_hint not in subject:
                     continue
                 match = pattern.search(subject + "\n" + body)
-                if match:
+                if match and match.group(1) not in excluded_codes:
                     return match.group(1)
         finally:
             try:
@@ -299,6 +302,7 @@ def main():
     options.add_argument("--window-size=1400,1000")
     driver = webdriver.Chrome(options=options)
     started = datetime.now(timezone.utc).timestamp()
+    login_code = None
     try:
         driver.get(os.getenv("EUSERV_LOGIN_URL", "https://support.euserv.de/"))
         login_selectors = [(By.NAME, "email"), (By.CSS_SELECTOR, "input[type='email']"), (By.NAME, "username"), (By.NAME, "login"), (By.ID, "username")]
@@ -316,13 +320,15 @@ def main():
         code_box = verification_code_box(driver, 8)
         if code_box:
             print("Waiting for EUserv login verification email…")
-            code_box.send_keys(wait_for_gmail_code(started, 180))
+            login_code = wait_for_gmail_code(started, 180)
+            code_box.send_keys(login_code)
             click_by_text(driver, ["confirm", "verify", "bestätigen", "weiter", "continue"], args.timeout)
 
         contract = os.getenv("EUSERV_CONTRACT_NUMBER", "").strip()
         if contract:
             click_by_text(driver, [contract], args.timeout)
         print("Looking for renewal action…")
+        renewal_requested_at = time.time()
         try:
             click_by_text(driver, ["verlängern", "verlaengern", "renew", "extension"], args.timeout)
         except TimeoutException:
@@ -344,7 +350,8 @@ def main():
         code_box = verification_code_box(driver, 8)
         if code_box:
             print("Waiting for EUserv renewal verification email…")
-            code_box.send_keys(wait_for_gmail_code(started, 180))
+            excluded = {login_code} if login_code else set()
+            code_box.send_keys(wait_for_gmail_code(renewal_requested_at, 180, excluded))
 
         if not args.commit:
             print("Reached the renewal confirmation step. No final action was sent. Re-run with --commit to submit.")

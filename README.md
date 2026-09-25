@@ -9,6 +9,7 @@
 - EUserv 使用 Chromium 直连，可复用固定浏览器会话。
 - Gmail IMAP 可单独使用 SOCKS5 代理，不影响 EUserv 流量。
 - Telegram 可单独使用 SOCKS5 代理。
+- Gmail 只接受本次操作后到达的最新匹配 PIN，忽略历史邮件和本次已使用的登录 PIN。
 - 默认不提交最终续期；只有 `--commit` 才会正式确认。
 - 每次运行最多执行一次续期，不自动重复登录或重复提交。
 - 正式运行时推送三类 Telegram 结果：
@@ -193,6 +194,8 @@ python3 -m py_compile euserv_renew.py
 ### Gmail TLS 能连接，但认证超时
 
 设置 `GMAIL_SOCKS_HOST` 和 `GMAIL_SOCKS_PORT`，并确认已安装 `python3-socks`。代理只用于 Gmail IMAP。
+
+脚本从最近邮件开始倒序检查，并按本次登录或续期请求时间过滤。历史 PIN 邮件可以继续保留在邮箱中；脚本使用 IMAP `PEEK` 读取，不会删除邮件。
 
 ### 显示 `No renewal action is currently available`
 
