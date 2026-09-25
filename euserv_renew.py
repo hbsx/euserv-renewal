@@ -152,6 +152,64 @@ def wait_for_gmail_code(not_before, timeout, excluded_codes=None):
     raise TimeoutException("No matching verification email arrived before timeout")
 
 
+def wait_for_gmail_confirmation(not_before, timeout, contract_number=""):
+    """Wait for the newest EUserv contract-extension confirmation email."""
+    address = required("GMAIL_ADDRESS")
+    password = required("GMAIL_APP_PASSWORD").replace(" ", "")
+    sender_hint = os.getenv("GMAIL_FROM_HINT", "euserv").lower()
+    deadline = time.time() + timeout
+
+    while time.time() < deadline:
+        client = open_gmail_imap()
+        try:
+            client.login(address, password)
+            client.select("INBOX")
+            status, data = client.search(None, "ALL")
+            if status != "OK":
+                raise RuntimeError("Could not search Gmail INBOX")
+            for uid in reversed(data[0].split()[-30:]):
+                status, raw = client.fetch(uid, "(BODY.PEEK[])")
+                if status != "OK" or not raw or not raw[0]:
+                    continue
+                msg = message_from_bytes(raw[0][1])
+                try:
+                    from email.utils import parsedate_to_datetime
+                    sent_at = parsedate_to_datetime(msg.get("Date")).astimezone(timezone.utc).timestamp()
+                except Exception:
+                    sent_at = time.time()
+                if sent_at < not_before - 30:
+                    continue
+
+                sender = decoded(msg.get("From", "")).lower()
+                subject = decoded(msg.get("Subject", ""))
+                if sender_hint and sender_hint not in sender:
+                    continue
+                subject_match = re.search(
+                    r"extension\s+of\s+your\s+contract\s+(\d+)", subject, re.IGNORECASE
+                )
+                if not subject_match:
+                    continue
+                confirmed_contract = subject_match.group(1)
+                if contract_number and confirmed_contract != contract_number:
+                    continue
+
+                body = message_text(msg)
+                date_match = re.search(
+                    r"has\s+been\s+extended\s+until\s+(\d{4}-\d{2}-\d{2})",
+                    body,
+                    re.IGNORECASE,
+                )
+                if date_match:
+                    return confirmed_contract, date_match.group(1)
+        finally:
+            try:
+                client.logout()
+            except Exception:
+                pass
+        time.sleep(8)
+    raise TimeoutException("No matching contract-extension confirmation email arrived before timeout")
+
+
 def notify_telegram(message):
     """Send an optional Telegram notification without exposing credentials in logs."""
     token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
@@ -356,6 +414,7 @@ def main():
         if not args.commit:
             print("Reached the renewal confirmation step. No final action was sent. Re-run with --commit to submit.")
             return
+        submitted_at = time.time()
         click_by_text(driver, ["confirm renewal", "renew now", "verlängern", "bestätigen", "confirm"], args.timeout)
         success_markers = (
             "contract extension was successful",
@@ -370,11 +429,28 @@ def main():
             print("Renewal confirmed by EUserv.")
             notify_telegram("✅ EUserv contract renewal succeeded.")
         except TimeoutException:
-            print("Renewal was submitted, but EUserv did not show a recognized success message. No Telegram success notice was sent.")
-            notify_telegram(
-                "❌ EUserv renewal was submitted, but the website did not show a recognized success message. "
-                "Please check the account and systemd log."
-            )
+            print("No recognized success message on the page; waiting for the EUserv confirmation email…")
+            confirmation_timeout = int(os.getenv("GMAIL_CONFIRMATION_TIMEOUT", "300"))
+            try:
+                confirmed_contract, extended_until = wait_for_gmail_confirmation(
+                    submitted_at, confirmation_timeout, contract
+                )
+                print(
+                    "Renewal confirmed by email for contract {} until {}.".format(
+                        confirmed_contract, extended_until
+                    )
+                )
+                notify_telegram(
+                    "✅ EUserv contract {} renewed until {} (confirmed by email).".format(
+                        confirmed_contract, extended_until
+                    )
+                )
+            except TimeoutException:
+                print("Renewal was submitted, but neither the page nor a new confirmation email proved success.")
+                notify_telegram(
+                    "❌ EUserv renewal was submitted, but neither the website nor a new confirmation email "
+                    "proved success. Please check the account and systemd log."
+                )
     finally:
         if os.getenv("HEADLESS", "false").lower() == "true":
             driver.quit()
