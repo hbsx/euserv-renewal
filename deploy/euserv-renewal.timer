@@ -1,0 +1,11 @@
+[Unit]
+Description=Run EUserv renewal monthly
+
+[Timer]
+OnCalendar=*-*-25 07:30:00
+Persistent=false
+AccuracySec=1min
+Unit=euserv-renewal.service
+
+[Install]
+WantedBy=timers.target

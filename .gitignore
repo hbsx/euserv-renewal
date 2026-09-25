@@ -1,0 +1,10 @@
+.env
+__pycache__/
+.venv/
+browser-profile/
+no-renewal-action.png
+*.log
+.venv/
+browser-profile/
+no-renewal-action.png
+*.log
