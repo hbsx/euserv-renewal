@@ -63,6 +63,12 @@ class MailParsingTests(unittest.TestCase):
         self.assertFalse(app.contract_number_in_text("Contract 4441667", "444166"))
         self.assertEqual("444166", app.canonical_contract_number(" 000-444166 "))
 
+    def test_action_label_ignores_trailing_decoration_only(self):
+        self.assertEqual("renew now", app.normalized_label("  Renew   now » "))
+        self.assertEqual("extend contract", app.normalized_label("Extend contract›"))
+        self.assertEqual("request extension", app.normalized_label("Request extension →"))
+        self.assertNotEqual("renew", app.normalized_label("Renew contract"))
+
 
 class GmailPollingTests(unittest.TestCase):
     @patch.dict(

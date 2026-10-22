@@ -366,7 +366,9 @@ def first_visible(driver, selectors, timeout=0):
 
 
 def normalized_label(value):
-    return re.sub(r"\s+", " ", value or "").strip().casefold()
+    normalized = re.sub(r"\s+", " ", value or "").strip()
+    normalized = re.sub(r"[»›→]+$", "", normalized).rstrip()
+    return normalized.casefold()
 
 
 def element_label(element):
@@ -376,7 +378,7 @@ def element_label(element):
 def find_exact_clickable(search_root, labels, excluded_ids=None):
     expected = {normalized_label(label) for label in labels}
     excluded_ids = set(excluded_ids or ())
-    selector = "a, button, input[type='submit'], input[type='button']"
+    selector = "a, button, input[type='submit'], input[type='button'], [role='button']"
     for element in search_root.find_elements(By.CSS_SELECTOR, selector):
         if element.id in excluded_ids:
             continue
@@ -678,10 +680,14 @@ def main():
             "verlaengern",
             "vertrag verlängern",
             "renew",
+            "renew now",
             "renew contract",
+            "extend now",
             "extend contract",
+            "extend contract now",
             "extension",
             "contract extension",
+            "request extension",
         ]
         try:
             renewal_trigger = wait_for_exact_clickable(driver, renewal_labels, args.timeout)
