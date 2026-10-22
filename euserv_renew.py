@@ -4,16 +4,18 @@ Credentials are supplied only by environment variables (usually through a local 
 file).  The final renewal confirmation is intentionally gated behind --commit.
 """
 import argparse
+import html
 import http.client
 import imaplib
 import os
 import re
+import signal
 import ssl
 import sys
 import time
 import urllib.parse
 import urllib.request
-from datetime import datetime, timezone
+from datetime import timezone
 from email import message_from_bytes
 from email.header import decode_header
 from pathlib import Path
@@ -22,6 +24,14 @@ from selenium import webdriver
 from selenium.common.exceptions import TimeoutException
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
+
+
+class RenewalFailure(RuntimeError):
+    """A terminal renewal outcome that has already been explained to the user."""
+
+
+class GmailAuthenticationError(RuntimeError):
+    """A non-transient Gmail authentication failure."""
 
 
 def load_dotenv(path=".env"):
@@ -33,6 +43,8 @@ def load_dotenv(path=".env"):
             line = line.strip()
             if not line or line.startswith("#") or "=" not in line:
                 continue
+            if line.startswith("export "):
+                line = line[7:].lstrip()
             key, value = line.split("=", 1)
             os.environ.setdefault(key.strip(), value.strip().strip("\"'"))
 
@@ -55,15 +67,37 @@ def decoded(value):
 
 
 def message_text(msg):
+    """Return readable message text, preferring plain text over HTML."""
     parts = msg.walk() if msg.is_multipart() else [msg]
-    chunks = []
+    plain_chunks = []
+    html_chunks = []
     for part in parts:
-        if part.get_content_type() != "text/plain":
+        content_type = part.get_content_type()
+        if content_type not in ("text/plain", "text/html"):
+            continue
+        if part.get_content_disposition() == "attachment":
             continue
         payload = part.get_payload(decode=True)
         if payload:
-            chunks.append(payload.decode(part.get_content_charset() or "utf-8", errors="replace"))
-    return "\n".join(chunks)
+            text = payload.decode(part.get_content_charset() or "utf-8", errors="replace")
+            if content_type == "text/plain":
+                plain_chunks.append(text)
+            else:
+                html_chunks.append(text)
+    if plain_chunks:
+        return "\n".join(plain_chunks)
+    if not html_chunks:
+        return ""
+    rendered = "\n".join(html_chunks)
+    rendered = re.sub(r"(?is)<(script|style).*?>.*?</\1>", " ", rendered)
+    rendered = re.sub(r"(?s)<[^>]+>", " ", rendered)
+    return re.sub(r"\s+", " ", html.unescape(rendered)).strip()
+
+
+def canonical_contract_number(value):
+    """Normalize a contract number for comparisons without changing its meaning."""
+    digits = re.sub(r"\D", "", value or "")
+    return digits.lstrip("0") or ("0" if digits else "")
 
 
 def message_timestamp(msg, fetch_metadata):
@@ -114,52 +148,84 @@ def open_gmail_imap():
     return SocksIMAP4SSL(imap_host, 993, timeout=timeout)
 
 
-def wait_for_gmail_code(not_before, timeout, excluded_codes=None):
+def close_gmail_imap(client):
+    if client is None:
+        return
+    try:
+        client.logout()
+    except Exception:
+        pass
+
+
+def open_authenticated_gmail(address, password):
+    client = open_gmail_imap()
+    try:
+        client.login(address, password)
+        return client
+    except imaplib.IMAP4.error as error:
+        close_gmail_imap(client)
+        raise GmailAuthenticationError(
+            "Gmail authentication failed; check the address, app password, and IMAP access"
+        ) from error
+
+
+def gmail_poll_delay(deadline):
+    time.sleep(max(0, min(8, deadline - time.time())))
+
+
+def wait_for_gmail_code(not_before, timeout, excluded_codes=None, subject_hint=None):
     """Poll Gmail for the newest recent PIN, ignoring old or already-used codes."""
     address = required("GMAIL_ADDRESS")
     password = required("GMAIL_APP_PASSWORD").replace(" ", "")
     sender_hint = os.getenv("GMAIL_FROM_HINT", "euserv").lower()
-    subject_hint = os.getenv("GMAIL_SUBJECT_HINT", "").lower()
+    if subject_hint is None:
+        subject_hint = os.getenv("GMAIL_SUBJECT_HINT", "")
+    subject_hint = subject_hint.lower()
+    mailbox = os.getenv("GMAIL_MAILBOX", "INBOX").strip() or "INBOX"
     pattern = re.compile(os.getenv("CODE_REGEX", r"(?<!\d)(\d{6})(?!\d)"))
     excluded_codes = set(excluded_codes or ())
     deadline = time.time() + timeout
+    client = None
 
-    while time.time() < deadline:
-        client = open_gmail_imap()
-        try:
-            client.login(address, password)
-            client.select("INBOX")
-            status, data = client.search(None, "ALL")
-            if status != "OK":
-                raise RuntimeError("Could not search Gmail INBOX")
-            for uid in reversed(data[0].split()[-20:]):
-                # PEEK avoids changing the message's read/unread state where supported.
-                status, raw = client.fetch(uid, "(INTERNALDATE BODY.PEEK[])")
-                if status != "OK" or not raw or not raw[0]:
-                    continue
-                msg = message_from_bytes(raw[0][1])
-                sent_at = message_timestamp(msg, raw[0][0])
-                if sent_at is None:
-                    continue
-                # Allow only a small amount of clock skew; historical PIN mail is ignored.
-                if sent_at < not_before - 30:
-                    continue
-                sender = decoded(msg.get("From", "")).lower()
-                subject = decoded(msg.get("Subject", "")).lower()
-                body = message_text(msg)
-                if sender_hint and sender_hint not in sender:
-                    continue
-                if subject_hint and subject_hint not in subject:
-                    continue
-                match = pattern.search(subject + "\n" + body)
-                if match and match.group(1) not in excluded_codes:
-                    return match.group(1)
-        finally:
+    try:
+        while time.time() < deadline:
             try:
-                client.logout()
-            except Exception:
-                pass
-        time.sleep(8)
+                if client is None:
+                    client = open_authenticated_gmail(address, password)
+                status, _ = client.select(mailbox, readonly=True)
+                if status != "OK":
+                    raise imaplib.IMAP4.error("Could not select Gmail mailbox {!r}".format(mailbox))
+                status, data = client.search(None, "ALL")
+                if status != "OK":
+                    raise imaplib.IMAP4.error("Could not search Gmail mailbox {!r}".format(mailbox))
+                for uid in reversed(data[0].split()[-20:]):
+                    # PEEK avoids changing the message's read/unread state where supported.
+                    status, raw = client.fetch(uid, "(INTERNALDATE BODY.PEEK[])")
+                    if status != "OK" or not raw or not raw[0] or not isinstance(raw[0], tuple):
+                        continue
+                    msg = message_from_bytes(raw[0][1])
+                    sent_at = message_timestamp(msg, raw[0][0])
+                    if sent_at is None or sent_at < not_before - 30:
+                        continue
+                    sender = decoded(msg.get("From", "")).lower()
+                    subject = decoded(msg.get("Subject", "")).lower()
+                    body = message_text(msg)
+                    if sender_hint and sender_hint not in sender:
+                        continue
+                    if subject_hint and subject_hint not in subject:
+                        continue
+                    match = pattern.search(subject + "\n" + body)
+                    if match and match.group(1) not in excluded_codes:
+                        return match.group(1)
+            except GmailAuthenticationError:
+                raise
+            except (imaplib.IMAP4.error, OSError, ssl.SSLError) as error:
+                print("Temporary Gmail error; reconnecting: {}".format(error), file=sys.stderr)
+                close_gmail_imap(client)
+                client = None
+            gmail_poll_delay(deadline)
+    finally:
+        close_gmail_imap(client)
     raise TimeoutException("No matching verification email arrived before timeout")
 
 
@@ -168,54 +234,63 @@ def wait_for_gmail_confirmation(not_before, timeout, contract_number=""):
     address = required("GMAIL_ADDRESS")
     password = required("GMAIL_APP_PASSWORD").replace(" ", "")
     sender_hint = os.getenv("GMAIL_FROM_HINT", "euserv").lower()
+    mailbox = os.getenv("GMAIL_MAILBOX", "INBOX").strip() or "INBOX"
+    expected_contract = canonical_contract_number(contract_number)
     deadline = time.time() + timeout
+    client = None
 
-    while time.time() < deadline:
-        client = open_gmail_imap()
-        try:
-            client.login(address, password)
-            client.select("INBOX")
-            status, data = client.search(None, "ALL")
-            if status != "OK":
-                raise RuntimeError("Could not search Gmail INBOX")
-            for uid in reversed(data[0].split()[-30:]):
-                status, raw = client.fetch(uid, "(INTERNALDATE BODY.PEEK[])")
-                if status != "OK" or not raw or not raw[0]:
-                    continue
-                msg = message_from_bytes(raw[0][1])
-                sent_at = message_timestamp(msg, raw[0][0])
-                if sent_at is None:
-                    continue
-                if sent_at < not_before - 30:
-                    continue
-
-                sender = decoded(msg.get("From", "")).lower()
-                subject = decoded(msg.get("Subject", ""))
-                if sender_hint and sender_hint not in sender:
-                    continue
-                subject_match = re.search(
-                    r"extension\s+of\s+your\s+contract\s+(\d+)", subject, re.IGNORECASE
-                )
-                if not subject_match:
-                    continue
-                confirmed_contract = subject_match.group(1)
-                if contract_number and confirmed_contract != contract_number:
-                    continue
-
-                body = message_text(msg)
-                date_match = re.search(
-                    r"has\s+been\s+extended\s+until\s+(\d{4}-\d{2}-\d{2})",
-                    body,
-                    re.IGNORECASE,
-                )
-                if date_match:
-                    return confirmed_contract, date_match.group(1)
-        finally:
+    try:
+        while time.time() < deadline:
             try:
-                client.logout()
-            except Exception:
-                pass
-        time.sleep(8)
+                if client is None:
+                    client = open_authenticated_gmail(address, password)
+                status, _ = client.select(mailbox, readonly=True)
+                if status != "OK":
+                    raise imaplib.IMAP4.error("Could not select Gmail mailbox {!r}".format(mailbox))
+                status, data = client.search(None, "ALL")
+                if status != "OK":
+                    raise imaplib.IMAP4.error("Could not search Gmail mailbox {!r}".format(mailbox))
+                for uid in reversed(data[0].split()[-30:]):
+                    status, raw = client.fetch(uid, "(INTERNALDATE BODY.PEEK[])")
+                    if status != "OK" or not raw or not raw[0] or not isinstance(raw[0], tuple):
+                        continue
+                    msg = message_from_bytes(raw[0][1])
+                    sent_at = message_timestamp(msg, raw[0][0])
+                    if sent_at is None or sent_at < not_before - 30:
+                        continue
+
+                    sender = decoded(msg.get("From", "")).lower()
+                    subject = decoded(msg.get("Subject", ""))
+                    if sender_hint and sender_hint not in sender:
+                        continue
+                    subject_match = re.search(
+                        r"extension\s+of\s+your\s+contract\s+([\d\s-]+)",
+                        subject,
+                        re.IGNORECASE,
+                    )
+                    if not subject_match:
+                        continue
+                    confirmed_contract = canonical_contract_number(subject_match.group(1))
+                    if expected_contract and confirmed_contract != expected_contract:
+                        continue
+
+                    body = message_text(msg)
+                    date_match = re.search(
+                        r"has\s+been\s+extended\s+until\s+(\d{4}-\d{2}-\d{2})",
+                        body,
+                        re.IGNORECASE,
+                    )
+                    if date_match:
+                        return confirmed_contract, date_match.group(1)
+            except GmailAuthenticationError:
+                raise
+            except (imaplib.IMAP4.error, OSError, ssl.SSLError) as error:
+                print("Temporary Gmail error; reconnecting: {}".format(error), file=sys.stderr)
+                close_gmail_imap(client)
+                client = None
+            gmail_poll_delay(deadline)
+    finally:
+        close_gmail_imap(client)
     raise TimeoutException("No matching contract-extension confirmation email arrived before timeout")
 
 
@@ -290,19 +365,113 @@ def first_visible(driver, selectors, timeout=0):
         time.sleep(0.5)
 
 
-def click_by_text(driver, labels, timeout):
-    conditions = []
-    for label in labels:
-        normalized = label.lower()
-        conditions.append("contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), '{}')".format(normalized))
-        conditions.append("self::input and contains(translate(@value, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), '{}')".format(normalized))
-    xpath = "//*[self::a or self::button or self::input][{}]".format(
-        " or ".join(conditions)
-    )
-    element = WebDriverWait(driver, timeout).until(lambda d: first_visible(d, [(By.XPATH, xpath)]))
+def normalized_label(value):
+    return re.sub(r"\s+", " ", value or "").strip().casefold()
+
+
+def element_label(element):
+    return normalized_label(element.get_attribute("value") or element.text or "")
+
+
+def find_exact_clickable(search_root, labels, excluded_ids=None):
+    expected = {normalized_label(label) for label in labels}
+    excluded_ids = set(excluded_ids or ())
+    selector = "a, button, input[type='submit'], input[type='button']"
+    for element in search_root.find_elements(By.CSS_SELECTOR, selector):
+        if element.id in excluded_ids:
+            continue
+        if element.is_displayed() and element.is_enabled() and element_label(element) in expected:
+            return element
+    return None
+
+
+def click_exact_by_text(driver, labels, timeout, search_root=None, excluded_ids=None):
+    def locate(_driver):
+        root = search_root or _driver
+        return find_exact_clickable(root, labels, excluded_ids)
+
+    element = WebDriverWait(driver, timeout).until(locate)
     driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", element)
     element.click()
     return element
+
+
+def wait_for_exact_clickable(driver, labels, timeout, search_root=None, excluded_ids=None):
+    return WebDriverWait(driver, timeout).until(
+        lambda current_driver: find_exact_clickable(
+            search_root or current_driver,
+            labels,
+            excluded_ids,
+        )
+    )
+
+
+def contract_number_in_text(text, contract_number):
+    return bool(
+        re.search(
+            r"(?<!\d){}(?!\d)".format(re.escape(contract_number)),
+            text or "",
+        )
+    )
+
+
+def click_contract(driver, contract_number, timeout):
+    def locate(_driver):
+        candidates = []
+        for element in _driver.find_elements(By.CSS_SELECTOR, "a, button"):
+            if not element.is_displayed() or not element.is_enabled():
+                continue
+            label = element.get_attribute("textContent") or element.text or ""
+            if contract_number_in_text(label, contract_number):
+                candidates.append((len(normalized_label(label)), element))
+        if not candidates:
+            return None
+        return sorted(candidates, key=lambda item: item[0])[0][1]
+
+    element = WebDriverWait(driver, timeout).until(locate)
+    driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", element)
+    element.click()
+    return element
+
+
+def authenticated_page(driver):
+    """Recognize EUserv's authenticated navigation without trusting a stored cookie alone."""
+    if first_visible(
+        driver,
+        [
+            (By.CSS_SELECTOR, "input[type='password']"),
+            (By.NAME, "password"),
+            (By.ID, "password"),
+        ],
+    ):
+        return False
+    if first_visible(
+        driver,
+        [
+            (By.CSS_SELECTOR, "a[href*='logout' i]"),
+            (By.CSS_SELECTOR, "a[href*='logoff' i]"),
+        ],
+    ):
+        return True
+    navigation_markers = {
+        "contracts",
+        "customer data",
+        "customer account / invoices",
+        "system messages",
+        "support requests",
+    }
+    visible_markers = 0
+    for element in driver.find_elements(By.CSS_SELECTOR, "a"):
+        if element.is_displayed() and element_label(element) in navigation_markers:
+            visible_markers += 1
+    return visible_markers >= 2
+
+
+def wait_for_authenticated_page(driver, timeout):
+    try:
+        WebDriverWait(driver, timeout).until(authenticated_page)
+    except TimeoutException as error:
+        raise RuntimeError("EUserv login did not reach an authenticated account page") from error
 
 
 def wait_for_manual_captcha(driver, timeout):
@@ -318,6 +487,8 @@ def wait_for_manual_captcha(driver, timeout):
         return
     if os.getenv("HEADLESS", "false").lower() == "true":
         raise RuntimeError("A visual CAPTCHA was detected in headless mode; manual login is required")
+    if not sys.stdin.isatty():
+        raise RuntimeError("A visual CAPTCHA needs an interactive terminal and manual browser access")
     print("A visual CAPTCHA is displayed. Complete it in the browser, then press Enter here.")
     input()
 
@@ -344,6 +515,53 @@ def verification_code_box(driver, timeout):
     )
 
 
+def acquire_process_lock(path):
+    """Hold a non-blocking process lock on Linux for the lifetime of the returned file."""
+    if not sys.platform.startswith("linux"):
+        return None
+    import fcntl
+
+    lock_file = open(path, "a+", encoding="utf-8")
+    try:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        lock_file.close()
+        raise RenewalFailure("Another EUserv renewal process is already running")
+    return lock_file
+
+
+def final_confirmation_button(driver, code_box, renewal_trigger, timeout):
+    """Find the final submit control without reusing the initial renewal action."""
+    excluded_ids = {renewal_trigger.id} if renewal_trigger is not None else set()
+    specific_labels = [
+        "confirm renewal",
+        "renew now",
+        "confirm extension",
+        "extend contract now",
+        "jetzt verlängern",
+        "verlängerung bestätigen",
+    ]
+    form = None
+    if code_box is not None:
+        try:
+            form = code_box.find_element(By.XPATH, "ancestor::form[1]")
+        except Exception:
+            pass
+
+    def locate(current_driver):
+        if form is not None:
+            in_form = find_exact_clickable(
+                form,
+                specific_labels + ["confirm", "verify", "bestätigen", "continue", "weiter"],
+                excluded_ids,
+            )
+            if in_form:
+                return in_form
+        return find_exact_clickable(current_driver, specific_labels, excluded_ids)
+
+    return WebDriverWait(driver, timeout).until(locate)
+
+
 def main():
     load_dotenv()
     parser = argparse.ArgumentParser(description="EUserv renewal helper")
@@ -351,29 +569,63 @@ def main():
     parser.add_argument("--timeout", type=int, default=int(os.getenv("TIMEOUT_SECONDS", "25")))
     args = parser.parse_args()
 
-    username, password = required("EUSERV_USERNAME"), required("EUSERV_PASSWORD")
-    options = webdriver.ChromeOptions()
-    if os.getenv("HEADLESS", "false").lower() == "true":
-        options.add_argument("--headless=new")
-    chrome_binary = os.getenv("CHROME_BINARY", "").strip()
-    if chrome_binary:
-        options.binary_location = chrome_binary
-    if sys.platform.startswith("linux") and hasattr(os, "geteuid") and os.geteuid() == 0:
-        # Chromium otherwise refuses to start as root in a Debian container.
-        options.add_argument("--no-sandbox")
-        options.add_argument("--disable-dev-shm-usage")
-    profile_setting = os.getenv("CHROME_PROFILE_DIR", "browser-profile")
-    profile_dir = Path(profile_setting)
-    if not profile_dir.is_absolute():
-        profile_dir = Path.cwd() / profile_dir
-    profile_dir.mkdir(parents=True, exist_ok=True)
-    options.add_argument("--user-data-dir={}".format(profile_dir))
-    options.add_argument("--window-size=1400,1000")
-    driver = webdriver.Chrome(options=options)
-    started = datetime.now(timezone.utc).timestamp()
+    notification_attempted = False
+    driver = None
+    lock_file = None
     login_code = None
+
+    def notify_once(message):
+        nonlocal notification_attempted
+        if notification_attempted:
+            return
+        notification_attempted = True
+        notify_telegram(message)
+
+    def handle_termination(signum, _frame):
+        if args.commit:
+            notify_once(
+                "❌ EUserv automatic renewal was terminated before completion. "
+                "No automatic retry will be made; please check the account and systemd log."
+            )
+        raise SystemExit(128 + signum)
+
+    if hasattr(signal, "SIGTERM"):
+        signal.signal(signal.SIGTERM, handle_termination)
+
     try:
-        driver.get(os.getenv("EUSERV_LOGIN_URL", "https://support.euserv.de/"))
+        contract = os.getenv("EUSERV_CONTRACT_NUMBER", "").strip()
+        if args.commit and not contract:
+            raise RuntimeError("EUSERV_CONTRACT_NUMBER is required when --commit is used")
+        lock_file = acquire_process_lock(os.getenv("LOCK_FILE", "/run/euserv-renewal.lock"))
+        username, password = required("EUSERV_USERNAME"), required("EUSERV_PASSWORD")
+        options = webdriver.ChromeOptions()
+        if os.getenv("HEADLESS", "false").lower() == "true":
+            options.add_argument("--headless=new")
+        chrome_binary = os.getenv("CHROME_BINARY", "").strip()
+        if chrome_binary:
+            options.binary_location = chrome_binary
+        if sys.platform.startswith("linux") and hasattr(os, "geteuid") and os.geteuid() == 0:
+            # Chromium otherwise refuses to start as root in a Debian container.
+            options.add_argument("--no-sandbox")
+            options.add_argument("--disable-dev-shm-usage")
+        profile_setting = os.getenv("CHROME_PROFILE_DIR", "browser-profile")
+        profile_dir = Path(profile_setting)
+        if not profile_dir.is_absolute():
+            profile_dir = Path.cwd() / profile_dir
+        profile_dir.mkdir(parents=True, exist_ok=True)
+        options.add_argument("--user-data-dir={}".format(profile_dir))
+        options.add_argument("--window-size=1400,1000")
+        driver = webdriver.Chrome(options=options)
+        driver.set_page_load_timeout(int(os.getenv("PAGE_LOAD_TIMEOUT", "60")))
+        try:
+            driver.get(os.getenv("EUSERV_LOGIN_URL", "https://support.euserv.de/"))
+        except TimeoutException:
+            print("EUserv page load reached its time limit; validating the loaded page.")
+            try:
+                driver.execute_script("window.stop();")
+            except Exception:
+                pass
+
         login_selectors = [(By.NAME, "email"), (By.CSS_SELECTOR, "input[type='email']"), (By.NAME, "username"), (By.NAME, "login"), (By.ID, "username")]
         login_box = first_visible(driver, login_selectors, 5)
         if login_box:
@@ -381,27 +633,58 @@ def main():
             login_box.send_keys(username)
             fill(driver, [(By.CSS_SELECTOR, "input[type='password']"), (By.NAME, "password"), (By.ID, "password")], password, args.timeout)
             wait_for_manual_captcha(driver, args.timeout)
-            click_by_text(driver, ["login", "anmelden", "sign in"], args.timeout)
+            login_submitted_at = time.time()
+            click_exact_by_text(driver, ["login", "anmelden", "sign in"], args.timeout)
+            try:
+                login_state = WebDriverWait(driver, args.timeout).until(
+                    lambda current_driver: verification_code_box(current_driver, 0)
+                    or ("authenticated" if authenticated_page(current_driver) else None)
+                )
+            except TimeoutException as error:
+                raise RuntimeError("EUserv login appears to have failed") from error
+
+            if not isinstance(login_state, str):
+                code_box = login_state
+                print("Waiting for EUserv login verification email…")
+                login_subject = os.getenv(
+                    "GMAIL_LOGIN_SUBJECT_HINT",
+                ) or os.getenv("GMAIL_SUBJECT_HINT", "")
+                login_code = wait_for_gmail_code(
+                    login_submitted_at,
+                    180,
+                    subject_hint=login_subject,
+                )
+                code_box.send_keys(login_code)
+                click_exact_by_text(
+                    driver,
+                    ["confirm", "verify", "bestätigen", "weiter", "continue"],
+                    args.timeout,
+                )
+                wait_for_authenticated_page(driver, args.timeout)
         else:
             print("Reusing existing EUserv browser session; no login submitted.")
+            if verification_code_box(driver, 0):
+                raise RuntimeError(
+                    "The saved browser session is already waiting for a verification PIN; "
+                    "a fresh automatic login was not submitted"
+                )
+            wait_for_authenticated_page(driver, args.timeout)
 
-        # Some accounts ask for an email code immediately after login.
-        code_box = verification_code_box(driver, args.timeout)
-        if code_box:
-            print("Waiting for EUserv login verification email…")
-            login_code = wait_for_gmail_code(started, 180)
-            code_box.send_keys(login_code)
-            click_by_text(driver, ["confirm", "verify", "bestätigen", "weiter", "continue"], args.timeout)
-
-        contract = os.getenv("EUSERV_CONTRACT_NUMBER", "").strip()
-        if args.commit and not contract:
-            raise RuntimeError("EUSERV_CONTRACT_NUMBER is required when --commit is used")
         if contract:
-            click_by_text(driver, [contract], args.timeout)
+            click_contract(driver, contract, args.timeout)
         print("Looking for renewal action…")
-        renewal_requested_at = time.time()
+        renewal_labels = [
+            "verlängern",
+            "verlaengern",
+            "vertrag verlängern",
+            "renew",
+            "renew contract",
+            "extend contract",
+            "extension",
+            "contract extension",
+        ]
         try:
-            click_by_text(driver, ["verlängern", "verlaengern", "renew", "extension"], args.timeout)
+            renewal_trigger = wait_for_exact_clickable(driver, renewal_labels, args.timeout)
         except TimeoutException:
             diagnostic = Path.cwd() / "no-renewal-action.png"
             try:
@@ -411,24 +694,54 @@ def main():
                 pass
             print("No renewal action is currently available. The contract may already be renewed or not yet be inside its renewal window.")
             if args.commit:
-                notify_telegram(
+                notify_once(
                     "⚠️ EUserv automatic renewal found no renewal action. "
-                    "The contract may already be renewed or outside its renewal window; please check the account."
+                    "The contract may already be renewed or outside its renewal window. "
+                    "No automatic retry will be made; please check the account."
                 )
+                raise RenewalFailure("No renewal action was available")
             return
+
+        if not args.commit:
+            print(
+                "A renewal action is available. Dry-run mode did not click it, request a PIN, "
+                "or submit any renewal."
+            )
+            return
+
+        renewal_requested_at = time.time()
+        driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", renewal_trigger)
+        renewal_trigger.click()
 
         # If the renewal flow sends a second email code, fill it in.
         code_box = verification_code_box(driver, args.timeout)
         if code_box:
             print("Waiting for EUserv renewal verification email…")
             excluded = {login_code} if login_code else set()
-            code_box.send_keys(wait_for_gmail_code(renewal_requested_at, 180, excluded))
+            renewal_subject = os.getenv(
+                "GMAIL_RENEWAL_SUBJECT_HINT",
+            ) or os.getenv("GMAIL_SUBJECT_HINT", "")
+            code_box.send_keys(
+                wait_for_gmail_code(
+                    renewal_requested_at,
+                    180,
+                    excluded,
+                    subject_hint=renewal_subject,
+                )
+            )
 
-        if not args.commit:
-            print("Reached the renewal confirmation step. No final action was sent. Re-run with --commit to submit.")
-            return
         submitted_at = time.time()
-        click_by_text(driver, ["confirm renewal", "renew now", "verlängern", "bestätigen", "confirm"], args.timeout)
+        confirmation_button = final_confirmation_button(
+            driver,
+            code_box,
+            renewal_trigger,
+            args.timeout,
+        )
+        driver.execute_script(
+            "arguments[0].scrollIntoView({block: 'center'});",
+            confirmation_button,
+        )
+        confirmation_button.click()
         success_markers = (
             "contract extension was successful",
             "contract successfully extended",
@@ -440,7 +753,7 @@ def main():
                 lambda d: any(marker in d.page_source.lower() for marker in success_markers)
             )
             print("Renewal confirmed by EUserv.")
-            notify_telegram("✅ EUserv contract renewal succeeded.")
+            notify_once("✅ EUserv contract renewal succeeded.")
         except TimeoutException:
             print("No recognized success message on the page; waiting for the EUserv confirmation email…")
             confirmation_timeout = int(os.getenv("GMAIL_CONFIRMATION_TIMEOUT", "300"))
@@ -453,30 +766,44 @@ def main():
                         confirmed_contract, extended_until
                     )
                 )
-                notify_telegram(
+                notify_once(
                     "✅ EUserv contract {} renewed until {} (confirmed by email).".format(
                         confirmed_contract, extended_until
                     )
                 )
             except TimeoutException:
                 print("Renewal was submitted, but neither the page nor a new confirmation email proved success.")
-                notify_telegram(
+                notify_once(
                     "❌ EUserv renewal was submitted, but neither the website nor a new confirmation email "
-                    "proved success. Please check the account and systemd log."
+                    "proved success. No automatic retry will be made; please check the account and systemd log."
                 )
-    except Exception:
+                raise RenewalFailure("Renewal submission could not be verified")
+    except Exception as error:
         diagnostic = Path.cwd() / "failure.png"
-        try:
-            driver.save_screenshot(str(diagnostic))
-            print("Failure screenshot saved to {}.".format(diagnostic), file=sys.stderr)
-        except Exception:
-            pass
+        if driver is not None:
+            try:
+                driver.save_screenshot(str(diagnostic))
+                print("Failure screenshot saved to {}.".format(diagnostic), file=sys.stderr)
+            except Exception:
+                pass
+        if args.commit and not notification_attempted:
+            detail = str(error).splitlines()[0][:240] or error.__class__.__name__
+            notify_once(
+                "❌ EUserv automatic renewal failed: {}. "
+                "No automatic retry will be made; please check the systemd log.".format(detail)
+            )
         raise
     finally:
-        if os.getenv("HEADLESS", "false").lower() == "true":
-            driver.quit()
-        else:
-            print("Browser left open for review. Close it when finished.")
+        if driver is not None:
+            if os.getenv("HEADLESS", "false").lower() == "true":
+                try:
+                    driver.quit()
+                except Exception as error:
+                    print("Could not close Chromium cleanly: {}".format(error), file=sys.stderr)
+            else:
+                print("Browser left open for review. Close it when finished.")
+        if lock_file is not None:
+            lock_file.close()
 
 
 if __name__ == "__main__":
@@ -484,18 +811,4 @@ if __name__ == "__main__":
         main()
     except Exception as error:
         print("ERROR [{}]: {}".format(type(error).__name__, error), file=sys.stderr)
-        if "--commit" in sys.argv:
-            try:
-                load_dotenv()
-                summary = str(error).replace("\r", " ").replace("\n", " ").strip()
-                if len(summary) > 180:
-                    summary = summary[:177] + "..."
-                detail = ": {}".format(summary) if summary else ""
-                notify_telegram(
-                    "❌ EUserv automatic renewal failed [{}]{}. Please check the systemd log.".format(
-                        type(error).__name__, detail
-                    )
-                )
-            except Exception as notify_error:
-                print("Failure notification could not be sent: {}".format(notify_error), file=sys.stderr)
         sys.exit(1)

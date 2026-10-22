@@ -10,8 +10,9 @@
 - Gmail IMAP 可单独使用 SOCKS5 代理，不影响 EUserv 流量。
 - Telegram 可单独使用 SOCKS5 代理。
 - Gmail 只接受本次操作后到达的最新匹配 PIN，忽略历史邮件和本次已使用的登录 PIN。
+- Gmail 连接会在轮询期间复用；临时断线才重连，认证失败会立即停止；纯文本和 HTML 邮件均可解析。
 - 网页未显示已知成功文字时，会等待最新的 `Extension of your contract` 邮件，并核对合同编号和新到期日期。
-- 默认不提交最终续期；只有 `--commit` 才会正式确认。
+- 默认只验证登录、合同和续期入口，不点击续期入口、不请求续期 PIN；只有 `--commit` 才会进入并正式确认续期流程。
 - 每次运行最多执行一次续期，不自动重复登录或重复提交。
 - 正式运行必须配置明确的合同编号，避免误操作其他合同。
 - 正式运行时推送三类 Telegram 结果：
@@ -38,13 +39,13 @@ deploy/euserv-renewal.timer     每月定时器示例
 
 ```bash
 apt update
-apt install -y git python3 python3-selenium python3-socks chromium chromium-driver util-linux
+apt install -y git python3 python3-selenium python3-socks chromium chromium-driver
 ```
 
 如果发行版没有 `python3-selenium`，可以改用虚拟环境：
 
 ```bash
-apt install -y python3-venv chromium chromium-driver util-linux
+apt install -y python3-venv chromium chromium-driver
 python3 -m venv /opt/euserv-renewal/.venv
 /opt/euserv-renewal/.venv/bin/pip install -r /opt/euserv-renewal/requirements.txt
 ```
@@ -75,6 +76,8 @@ EUSERV_CONTRACT_NUMBER=你的合同编号
 
 GMAIL_ADDRESS=your-address@gmail.com
 GMAIL_APP_PASSWORD=Google生成的16位应用专用密码
+GMAIL_LOGIN_SUBJECT_HINT=PIN for the Confirmation of a Security Check
+GMAIL_RENEWAL_SUBJECT_HINT=PIN for the Confirmation of a Security Check
 ```
 
 Gmail 应用专用密码需要 Google 账号已开启两步验证。不要使用 Gmail 登录密码，也不要把 `.env` 上传到 GitHub。
@@ -122,6 +125,7 @@ python3 -c "import euserv_renew as app; app.load_dotenv(); app.notify_telegram('
 ```bash
 cd /opt/euserv-renewal
 python3 -m py_compile euserv_renew.py
+python3 -m unittest discover -s tests -v
 python3 -c "from selenium import webdriver; o=webdriver.ChromeOptions(); o.add_argument('--headless=new'); o.add_argument('--no-sandbox'); o.add_argument('--disable-dev-shm-usage'); o.binary_location='/usr/bin/chromium'; d=webdriver.Chrome(options=o); print('Chromium OK'); d.quit()"
 ```
 
@@ -137,7 +141,7 @@ python3 -u euserv_renew.py
 python3 -u euserv_renew.py --commit
 ```
 
-`--commit` 会允许最终续期提交。首次测试不要添加它。若页面出现图形验证码，脚本不会绕过验证码；无头环境下本次运行会失败并退出。
+不带 `--commit` 时，脚本找到续期入口后就会退出，不点击该入口，也不会请求续期 PIN。`--commit` 会允许进入续期页面并最终提交。若页面出现图形验证码，脚本不会绕过验证码；无头或非交互环境下本次运行会失败并退出。
 
 ## 每月自动运行
 
@@ -157,7 +161,7 @@ systemctl enable --now euserv-renewal.timer
 systemctl list-timers euserv-renewal.timer --no-pager
 ```
 
-服务带有 `--commit`，因此定时触发属于正式运行。`flock` 防止并发；服务不自动重启；最长运行时间为 15 分钟；`Persistent=false` 表示错过当月时间后不会补跑。
+服务带有 `--commit`，因此定时触发属于正式运行。脚本内部使用非阻塞文件锁防止并发并在冲突时通知；服务不自动重启；最长运行时间为 30 分钟；`Persistent=false` 表示错过当月时间后不会补跑。任何失败都不会自动再次点击登录、请求 PIN 或提交续期。
 
 查看日志：
 
@@ -179,9 +183,11 @@ systemctl disable --now euserv-renewal.timer
 cd /opt/euserv-renewal
 git pull --ff-only
 python3 -m py_compile euserv_renew.py
+install -m 644 deploy/euserv-renewal.service /etc/systemd/system/euserv-renewal.service
+systemctl daemon-reload
 ```
 
-更新脚本不需要重新创建定时器；下一次触发会直接使用新版本。
+本次版本同时调整了服务超时和启动命令，因此需要重新安装 service 文件。定时器配置仍保持每月一次且不补跑。
 
 ## 安全建议
 

@@ -1,3 +1,2 @@
 selenium==4.27.1
 PySocks==1.7.1
-PySocks==1.7.1
